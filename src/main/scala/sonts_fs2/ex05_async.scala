@@ -23,9 +23,9 @@ object ex05_async extends IOApp {
       .covary[IO]
       .parEvalMap(4)(i => printWithThreadName(s"Value $i") >> IO.pure(i))
       .fold(0)(_ + _)
+      .evalMap(result => IO.shift(singleCs) *> printWithThreadName(s"Result: $result"))
       .compile
       .lastOrError
-      .flatMap(result => IO.shift(singleCs) *> printWithThreadName(s"Result: $result"))
       .flatMap(_ => IO(threadPool.shutdown()))
       .as(ExitCode.Success)
   }
