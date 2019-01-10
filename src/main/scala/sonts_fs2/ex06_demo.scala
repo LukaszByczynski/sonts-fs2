@@ -71,8 +71,8 @@ object streaming {
 
   private class ParquetPipe[F[_], A](chunkSize: Int)(implicit S: Sync[F]) {
 
-    private val emptyInputStream = Pull.done
 
+    private val emptyInputStream = Pull.done
     private def endOfStream(writer: ParquetWriter[F]) = {
       val closeWriter = Pull
         .acquire(
