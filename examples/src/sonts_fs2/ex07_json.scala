@@ -2,111 +2,90 @@
 
  import java.util.UUID
 
+ import cats.Monad
  import cats.effect._
  import cats.implicits._
  import org.http4s.dsl.Http4sDsl
- import org.http4s.server.blaze.BlazeBuilder
-
- import scala.concurrent.ExecutionContext
 
  object domain {
-   import java.util.UUID
-
-   import slick.jdbc.H2Profile.api._
-
-   class DbCustomer(tag: Tag) extends Table[(UUID, String)](tag, "customers") {
-     def id: Rep[UUID] = column[UUID]("id", O.PrimaryKey)
-
-     def email: Rep[String] = column[String]("email")
-
-     def * = (id, email)
-   }
+   case class Customer(id: Int, email: String)
  }
 
- object slick_infrastructure {
-
+ object doobie_infrastructure {
    import domain._
-   import slick.jdbc.H2Profile
-   import slick.jdbc.H2Profile.api._
+   import doobie._
+   import doobie.h2.H2Transactor
+   import doobie.implicits._
 
-   class DatabaseProvider[F[_]: ContextShift: Sync: Async] {
-
-     val customers = TableQuery[DbCustomer]
-
-     private val db: H2Profile.backend.Database = H2Profile.api.Database.forConfig("h2mem1")
-
-     private def runAsync[A](action: DBIO[A]): F[A] = {
-       import scala.util.{Failure, Success}
-
-       Sync[F].guarantee[A](
-         Async[F].async { cb =>
-           implicit val executionContext: ExecutionContext = ExecutionContext.global
-
-           db.run(action).onComplete {
-             case Success(value) => cb(Right(value))
-             case Failure(error) => cb(Left(error))
-           }
-         }
-       )(ContextShift[F].shift)
-     }
-
-     def runStream[A](
-       action: StreamingDBIO[_, A]
-     )(implicit C: ConcurrentEffect[F]): fs2.Stream[F, A] = {
-       import fs2.interop.reactivestreams._
-
-       db.stream(action).toStream.covary[F]
-     }
+   def findAll[F[_] : Monad](xa: Transactor[F]): fs2.Stream[F, Customer] = {
+     sql"select * from customer".query[Customer].stream.transact(xa)
    }
-   object DatabaseProvider {
-     def apply[F[_]: Sync: Async: ContextShift]: F[DatabaseProvider[F]] = {
-       implicit val executionContext: ExecutionContext = ExecutionContext.global
 
-       val dbProvider = new DatabaseProvider[F]
-       val actions = DBIO.seq(
-         dbProvider.customers.schema.create,
-         dbProvider.customers ++= Seq.fill(100000)(
-           (UUID.randomUUID(), s"${UUID.randomUUID().toString.replace("-", "")}@test.com")
-         )
-       )
+   def createDatabase[F[_] : Sync](xa: Transactor[F]): F[Int] = {
+     val createQuery =
+       sql"create table CUSTOMER (id INTEGER NOT NULL, email VARCHAR)".update.run
 
-       dbProvider.runAsync(actions).map(_ => dbProvider)
+     val customers = List.range(0, 100000).map(n =>
+      (n, s"${UUID.randomUUID().toString.replace("-", "")}@test.com")
+     )
+
+     val insertQuery = {
+       val sql = "insert into CUSTOMER (id, email) values (?, ?)"
+       Update[(Int, String)](sql).updateMany(customers)
      }
+
+     createQuery.transact(xa) >> insertQuery.transact(xa)
+   }
+
+   def createTransactor[F[_]: Async: ContextShift]: F[Resource[F, H2Transactor[F]]] = {
+     val transactor = for {
+       ce <- ExecutionContexts.fixedThreadPool[F](32) // our connect EC
+       te <- ExecutionContexts.cachedThreadPool[F] // our transaction EC
+       xa  <- H2Transactor.newH2Transactor[F](
+         "jdbc:h2:mem:test1;MODE=PostgreSQL;DB_CLOSE_DELAY=-1",
+         "test",
+         "test",
+         ce,
+         te
+       )
+     } yield xa
+
+     transactor.use(createDatabase[F]) >> Async[F].delay(transactor)
    }
  }
 
  object json {
+   import domain._
    import io.circe.Encoder
    import io.circe.generic.semiauto._
 
-   final case class CustomerJson(uuid: UUID, email: String)
-   implicit val customerJsonEncoder: Encoder[CustomerJson] = deriveEncoder[CustomerJson]
+   implicit val customerJsonEncoder: Encoder[Customer] = deriveEncoder[Customer]
  }
 
  object ex07_json extends IOApp with Http4sDsl[IO] {
 
-   import io.circe.syntax._
    import json._
+   import doobie_infrastructure._
+   import io.circe.syntax._
    import org.http4s.HttpRoutes
-   import slick.jdbc.H2Profile.api._
-   import slick_infrastructure._
+   import org.http4s.server.blaze.BlazeBuilder
 
    override def run(args: List[String]): IO[ExitCode] =
-     DatabaseProvider[IO].flatMap { implicit dbProvider =>
-       def findAll: fs2.Stream[IO, (UUID, String)] =
-         dbProvider.runStream(dbProvider.customers.result)
-
+     createTransactor[IO] >>= { xa =>
        val service: HttpRoutes[IO] = HttpRoutes.of[IO] {
-         case _ @GET -> Root =>
+         case _@GET -> Root =>
            Ok(
              fs2.Stream.emit("[") ++
-             findAll.map { case (id, email) => CustomerJson(id, email).asJson.noSpaces }.intersperse(",") ++
-             fs2.Stream.emit("]")
+               fs2.Stream.resource(xa)
+                 .flatMap(findAll[IO])
+                 .map(_.asJson.noSpaces)
+                 .intersperse(",") ++
+               fs2.Stream.emit("]")
            )
        }
 
        BlazeBuilder[IO]
-         .bindHttp(8080, "0.0.0.0")
+         .bindHttp(8080, "127.0.0.1")
          .mountService(service, "/")
          .serve
          .compile
